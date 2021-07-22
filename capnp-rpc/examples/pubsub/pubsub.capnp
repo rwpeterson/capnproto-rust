@@ -15,3 +15,12 @@ interface Subscriber(T) {
     # Sends a message from a publisher to the subscriber. To help with flow control, the subscriber should not
     # return from this method until it is ready to process the next message.
 }
+
+struct Qux {
+    foo @0 :UInt64;
+    bar @1 :UInt64;
+}
+
+struct Baz {
+    baz @0 :List(List(Qux));
+}

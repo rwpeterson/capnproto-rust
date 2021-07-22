@@ -24,14 +24,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use capnp_rpc::{RpcSystem, twoparty, rpc_twoparty_capnp};
-use crate::pubsub_capnp::{publisher, subscriber, subscription};
+use crate::pubsub_capnp::{publisher, subscriber, subscription, qux, baz};
 
 use capnp::capability::Promise;
 
 use futures::{AsyncReadExt, FutureExt, StreamExt};
 
 struct SubscriberHandle {
-    client: subscriber::Client<::capnp::text::Owned>,
+    client: subscriber::Client<qux::Owned>,
     requests_in_flight: i32,
 }
 
@@ -78,10 +78,10 @@ impl PublisherImpl {
     }
 }
 
-impl publisher::Server<::capnp::text::Owned> for PublisherImpl {
+impl publisher::Server<qux::Owned> for PublisherImpl {
     fn subscribe(&mut self,
-                 params: publisher::SubscribeParams<::capnp::text::Owned>,
-                 mut results: publisher::SubscribeResults<::capnp::text::Owned>,)
+                 params: publisher::SubscribeParams<qux::Owned>,
+                 mut results: publisher::SubscribeResults<qux::Owned>,)
                  -> Promise<(), ::capnp::Error>
     {
         println!("subscribe");
@@ -130,24 +130,49 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Trigger sending approximately once per second.
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        // Trigger sending as fast as possible
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
         std::thread::spawn(move || {
-            while let Ok(()) = tx.unbounded_send(()) {
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+            loop {
+                let data = vec![(42u64, 42u64); 2 * 1024 * 1024 * 1024];
+                let mut msg = Box::new(capnp::message::Builder::new_default());
+                let msg_bdr = msg.init_root::<baz::Builder>();
+
+                // figure out the sizes of outer and inner lists
+                let n = 2usize.pow(27);
+                let full_lists = (data.len() / n) as u32;
+                let remainder = (data.len() % n) as u32;
+                let lists = if remainder > 0 {
+                    full_lists + 1
+                } else {
+                    full_lists
+                };
+
+                let mut outer_bdr = msg_bdr.init_baz(lists);
+                for (i, chunk) in data.chunks(n).enumerate() {
+                   let mut inner_bdr = outer_bdr.reborrow().init(i as u32, chunk.len() as u32);
+                    for (j, &(foo, bar)) in chunk.iter().enumerate() {
+                        let mut qux_bdr = inner_bdr.reborrow().get(j as u32);
+                        qux_bdr.set_foo(foo);
+                        qux_bdr.set_bar(bar);
+                    }
+                }
+                match tx.unbounded_send(msg) {
+                    Ok(()) => continue,
+                    Err(_) => break,
+                }
             }
         });
 
         let send_to_subscribers = async move {
-            while let Some(()) = rx.next().await {
+            while let Some(m) = rx.next().await {
                 let subscribers1 = subscribers.clone();
                 let subs = &mut subscribers.borrow_mut().subscribers;
                 for (&idx, mut subscriber) in subs.iter_mut() {
                     if subscriber.requests_in_flight < 5 {
                         subscriber.requests_in_flight += 1;
                         let mut request = subscriber.client.push_message_request();
-                        request.get().set_message(
-                            &format!("system time is: {:?}", ::std::time::SystemTime::now())[..])?;
+                        request.get().set_message(m.get_root_as_reader()?)?;
                         let subscribers2 = subscribers1.clone();
                         tokio::task::spawn_local(Box::pin(
                             request.send().promise.map(move |r| {
