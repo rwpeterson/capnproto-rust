@@ -111,6 +111,28 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = args[2].to_socket_addrs().unwrap().next().expect("could not parse address");
 
+    // Trigger sending as fast as possible
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+        use parking_lot::RwLock;
+        use std::sync::Arc;
+        let data = Arc::new(
+            RwLock::new(
+                vec![(42u64, 42u64); 64 * 1024 * 1024]
+            )
+        );
+        loop {
+            let (respond_to, response) = flume::bounded(1);
+            if let Err(_) = tx.send((data.clone(), respond_to)) {
+                break;
+            }
+            if let Err(_) = response.recv() {
+                break;
+            }
+        }
+    });
+
+
     tokio::task::LocalSet::new().run_until(async move {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         let (publisher_impl, subscribers) = PublisherImpl::new();
@@ -130,12 +152,13 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Trigger sending as fast as possible
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        std::thread::spawn(move || {
-            loop {
-                let data = vec![(42u64, 42u64); 2 * 1024 * 1024 * 1024];
-                let mut msg = Box::new(capnp::message::Builder::new_default());
+        let send_to_subscribers = async move {
+            let mut buf = capnp::Word::allocate_zeroed_vec(1 << 28);
+            let mut alloc = capnp::message::ScratchSpaceHeapAllocator::new(
+                capnp::Word::words_to_bytes_mut(&mut buf));
+            while let Ok((datam, response_to)) = rx.recv_async().await {
+                let data = datam.read();
+                let mut msg = capnp::message::Builder::new(&mut alloc);
                 let msg_bdr = msg.init_root::<baz::Builder>();
 
                 // figure out the sizes of outer and inner lists
@@ -157,22 +180,14 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         qux_bdr.set_bar(bar);
                     }
                 }
-                match tx.unbounded_send(msg) {
-                    Ok(()) => continue,
-                    Err(_) => break,
-                }
-            }
-        });
 
-        let send_to_subscribers = async move {
-            while let Some(m) = rx.next().await {
                 let subscribers1 = subscribers.clone();
                 let subs = &mut subscribers.borrow_mut().subscribers;
                 for (&idx, mut subscriber) in subs.iter_mut() {
                     if subscriber.requests_in_flight < 5 {
                         subscriber.requests_in_flight += 1;
                         let mut request = subscriber.client.push_message_request();
-                        request.get().set_message(m.get_root_as_reader()?)?;
+                        request.get().set_message(msg.get_root_as_reader()?)?;
                         let subscribers2 = subscribers1.clone();
                         tokio::task::spawn_local(Box::pin(
                             request.send().promise.map(move |r| {
@@ -190,6 +205,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })));
                     }
                 }
+                response_to.send(()).unwrap();
             }
             Ok::<(), Box<dyn std::error::Error>>(())
         };
