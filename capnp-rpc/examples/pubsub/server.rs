@@ -153,9 +153,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let send_to_subscribers = async move {
-            let mut buf = capnp::Word::allocate_zeroed_vec(1 << 28);
-            let mut alloc = capnp::message::ScratchSpaceHeapAllocator::new(
-                capnp::Word::words_to_bytes_mut(&mut buf));
+            let mut alloc = capnp::message::HeapAllocator::new();
             while let Ok((datam, response_to)) = rx.recv_async().await {
                 let data = datam.read();
                 let mut msg = capnp::message::Builder::new(&mut alloc);
